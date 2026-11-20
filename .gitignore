@@ -1,0 +1,11 @@
+.venv/
+.dev-answer/
+official-downloads/
+experiments/
+tools/
+dev/
+bench*/
+out/
+__pycache__/
+*.pyc
+target/

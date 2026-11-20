@@ -1,0 +1,13 @@
+fixtures/
+dev/
+out/
+.venv/
+bench*/
+official-downloads/
+.dev-answer/
+experiments/
+tools/
+__pycache__/
+.pytest_cache/
+*.md
+.git

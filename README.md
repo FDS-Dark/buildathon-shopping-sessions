@@ -1,93 +1,86 @@
-# austin
+# Shopping Sessions
 
+An exact, optimized Polars pipeline for the Databricks Shopping Sessions track. It resolves linked identities, cleans and deduplicates events and clicks, builds sessions, attributes and assists campaigns, and writes both required Parquet tables.
 
+The implementation passes all 36 official edge-case fixtures and exactly matches both official tables for the 1M-event public development set.
 
-## Getting started
+## Implementation
 
-To make it easy for you to get started with GitLab, here's a list of recommended next steps.
+- Strict raw-line CSV parsing implements the challenge dialect instead of relying on permissive CSV defaults.
+- Identity links are resolved transitively with byte-wise minimum canonical IDs.
+- Events are deduplicated before validation, then compacted and sessionized by canonical person.
+- Click attribution uses an exact backward as-of join with byte-wise click-ID tie-breaking.
+- Assist clicks are merged into seven-day campaign coverage intervals before the range join.
+- The image honors the scorer's CPU, memory, filesystem, UID, and offline runtime constraints.
 
-Already a pro? Just edit this README.md and make it your own. Want to make it easy? [Use the template at the bottom](#editing-this-readme)!
+## Run and test locally
 
-## Add your files
+You need Docker with buildx, and Python 3.10+ with `polars` for the test scripts. Install it with `pip install polars`.
 
-* [Create](https://docs.gitlab.com/user/project/repository/web_editor/#create-a-file) or [upload](https://docs.gitlab.com/user/project/repository/web_editor/#upload-a-file) files
-* [Add files using the command line](https://docs.gitlab.com/topics/git/add_files/#add-files-to-a-git-repository) or push an existing Git repository with the following command:
+Build the image and run all 36 fixtures:
 
+```sh
+make build        # docker buildx build --platform linux/amd64 --load -t shopping-sessions:latest .
+make fixtures     # runs the image on all 36 fixtures with scorer flags, diffs each against expected/
 ```
-cd existing_repo
-git remote add origin https://gitlab.com/austinkoske/personal/buildathon/austin.git
-git branch -M main
-git push -uf origin main
+
+Build, run, and check the 1M-event dev set. `make dev` needs `generate` on your PATH: build it from the track page's generator.zip (Rust 1.85 or newer; its README has the two commands).
+
+```sh
+make dev                                # generate --seed 1 --events 1000000 --clicks 250000 --output dev
+make run-dev                            # runs your image on dev/ with scorer flags and times it
+make check-dev                          # exact diff against dev-answer/, the track page's dev-answer.zip unzipped here
 ```
 
-## Integrate with your tools
+If your laptop cannot spare 8 cores and 24 GB, run with lower limits using `make run-dev CPUS=4 MEM=8g`. Your local times will not match the scorer anyway; only the board's times count.
 
-* [Set up project integrations](https://gitlab.com/austinkoske/personal/buildathon/austin/-/settings/integrations)
+- **x86 Linux and Windows machines.** Build and run the amd64 image natively.
+- **Apple-silicon Macs.** Emulating amd64 is slow. For fast local loops, build a native image with `make build run-dev PLATFORM=linux/arm64`. The Dockerfile pins no platform, so it builds either way. Check the amd64 image before you submit.
 
-## Collaborate with your team
+To iterate without Docker:
 
-* [Invite team members and collaborators](https://docs.gitlab.com/user/project/members/)
-* [Create a new merge request](https://docs.gitlab.com/user/project/merge_requests/creating_merge_requests/)
-* [Automatically close issues from merge requests](https://docs.gitlab.com/user/project/issues/managing_issues/#closing-issues-automatically)
-* [Enable merge request approvals](https://docs.gitlab.com/user/project/merge_requests/approvals/)
-* [Set auto-merge](https://docs.gitlab.com/user/project/merge_requests/auto_merge/)
+```sh
+pip install polars==2.1.0
+python3 scripts/run_fixtures.py fixtures -- python3 pipeline/pipeline.py
+```
 
-## Test and Deploy
+## Submitting and scoring
 
-Use the built-in continuous integration in GitLab.
+Submit your public GitHub repository on the Buildathon track page. Enter a commit SHA to score a specific revision, or leave it empty to score the newest commit on the default branch.
 
-* [Get started with GitLab CI/CD](https://docs.gitlab.com/ci/quick_start/)
-* [Analyze your code for known vulnerabilities with Static Application Security Testing (SAST)](https://docs.gitlab.com/user/application_security/sast/)
-* [Deploy to Kubernetes, Amazon EC2, or Amazon ECS using Auto Deploy](https://docs.gitlab.com/topics/autodevops/requirements/)
-* [Use pull-based deployments for improved Kubernetes management](https://docs.gitlab.com/user/clusters/agent/)
-* [Set up protected environments](https://docs.gitlab.com/ci/environments/protected_environments/)
+The image's `CMD` runs with no arguments. Exit code 0 means "done, check my output". Build time is never timed; only the run is timed. The track page lists the current practice limits and how the final is scored.
 
-***
+## Container limits
 
-# Editing this README
+Scorers are Google Cloud n2 Intel Xeon machines, Cascade Lake or newer, with AVX-512 available. Your container gets:
 
-When you're ready to make this README your own, just edit this file and use the handy template below (or feel free to structure it however you want - this is just a starting point!). Thanks to [makeareadme.com](https://www.makeareadme.com/) for this template.
+| Resource | Setting |
+| --- | --- |
+| `/data` | The dataset, read-only |
+| `/output` | Empty, writable. Write `/output/user_daily/` and `/output/campaign_daily/` as Parquet |
+| `/scratch` | Empty, writable, fast local disk for spills and temp files |
+| CPU / RAM | 8 vCPUs, hyperthreads of an Intel Xeon, 24 GB, no swap |
+| Network | None |
+| Env vars | `DATA_DIR=/data`, `OUTPUT_DIR=/output`, `SCRATCH_DIR=/scratch`, `HOME=/scratch`, `NCPU=8`, `MEM_GB=24` |
+| Filesystem | Root is read-only apart from `/tmp`, 64 MB in memory. The process runs as uid 1000, not root |
 
-## Suggestions for a good README
+## Common pitfalls
 
-Every project is different, so consider which of these sections apply to yours. The sections used in the template are suggestions for most open source projects. Also keep in mind that while a README can be too long and detailed, too long is better than too short. If you think your README is too long, consider utilizing another form of documentation rather than cutting out information.
+- **Polars' CSV reader differs from `rules.md`.** Its quoting and malformed-line handling may not match `rules.md`. Test against the fixtures before relying on it.
+- **Threads.** `pipeline.py` sets `POLARS_MAX_THREADS` from `NCPU` before importing Polars. Otherwise Polars sizes its thread pool from the host machine's cores, which inside Docker on a Mac can differ from your CPU limit.
+- **Memory.** The container has 24 GB and no swap. Eager DataFrames over 60M+ rows of strings fill that fast. Lazy queries and the streaming engine help, and `POLARS_TEMP_DIR` already points at `/scratch`.
+- **`\d` is not `[0-9]`.** In several regex engines, including Rust's used by Polars, `\d` matches any Unicode digit. The rules mean ASCII digits only.
+- **Extra files in output folders.** `_SUCCESS` and other non-Parquet files in the output folders are ignored.
 
-## Name
-Choose a self-explaining name for your project.
+## Self-checks
 
-## Description
-Let people know what your project can do specifically. Provide context and add a link to any reference visitors might be unfamiliar with. A list of Features or a Background subsection can also be added here. If there are alternatives to your project, this is a good place to list differentiating factors.
+- Summed over all rows, `sessions` and `revenue_cents` are equal in both tables.
+- `day` must be a Parquet `DATE`, not a string or timestamp.
+- Row order and the number of Parquet files do not matter. Exact column names do, and there must be no extra columns.
 
-## Badges
-On some READMEs, you may see small images that convey metadata, such as whether or not all the tests are passing for the project. You can use Shields to add some to your README. Many services also have instructions for adding a badge.
+## Files
 
-## Visuals
-Depending on what you are making, it can be a good idea to include screenshots or even a video (you'll frequently see GIFs rather than actual videos). Tools like ttygif can help, but check out Asciinema for a more sophisticated method.
-
-## Installation
-Within a particular ecosystem, there may be a common way of installing things, such as using Yarn, NuGet, or Homebrew. However, consider the possibility that whoever is reading your README is a novice and would like more guidance. Listing specific steps helps remove ambiguity and gets people to using your project as quickly as possible. If it only runs in a specific context like a particular programming language version or operating system or has dependencies that have to be installed manually, also add a Requirements subsection.
-
-## Usage
-Use examples liberally, and show the expected output if you can. It's helpful to have inline the smallest example of usage that you can demonstrate, while providing links to more sophisticated examples if they are too long to reasonably include in the README.
-
-## Support
-Tell people where they can go to for help. It can be any combination of an issue tracker, a chat room, an email address, etc.
-
-## Roadmap
-If you have ideas for releases in the future, it is a good idea to list them in the README.
-
-## Contributing
-State if you are open to contributions and what your requirements are for accepting them.
-
-For people who want to make changes to your project, it's helpful to have some documentation on how to get started. Perhaps there is a script that they should run or some environment variables that they need to set. Make these steps explicit. These instructions could also be useful to your future self.
-
-You can also document commands to lint the code or run tests. These steps help to ensure high code quality and reduce the likelihood that the changes inadvertently break something. Having instructions for running tests is especially helpful if it requires external setup, such as starting a Selenium server for testing in a browser.
-
-## Authors and acknowledgment
-Show your appreciation to those who have contributed to the project.
-
-## License
-For open source projects, say how it is licensed.
-
-## Project status
-If you have run out of energy or time for your project, put a note at the top of the README saying that development has slowed down or stopped completely. Someone may choose to fork your project or volunteer to step in as a maintainer or owner, allowing your project to keep going. You can also make an explicit request for maintainers.
+- `pipeline/pipeline.py` holds your pipeline code.
+- `Dockerfile` builds a `linux/amd64` image for the Intel Xeon scorers.
+- `fixtures/` holds the 36 official edge cases and expected tables.
+- `scripts/` runs your image the way the scorer does and diffs the output.
