@@ -914,15 +914,30 @@ fn owned_event_refs_only(files: &[MappedCsv], key: u64, bound: usize, ws: i64) -
     let offset_mask = (1u64 << offset_bits) - 1;
     let len_mask = (1u64 << len_bits) - 1;
     let invalid = AtomicBool::new(false);
-    let chunks: Vec<_> = files
+    let chunk_bytes = 8 * 1024 * 1024;
+    let mut scan_ranges = Vec::new();
+    for (fi, f) in files.iter().enumerate() {
+        let mut start = memchr(b'\n', &f.map).map_or(f.map.len(), |x| x + 1);
+        while start < f.map.len() {
+            let probe = (start + chunk_bytes).min(f.map.len());
+            let end = if probe == f.map.len() {
+                probe
+            } else {
+                memchr(b'\n', &f.map[probe..]).map_or(f.map.len(), |x| probe + x + 1)
+            };
+            scan_ranges.push((fi, start, end));
+            start = end
+        }
+    }
+    let chunks: Vec<_> = scan_ranges
         .par_iter()
-        .enumerate()
-        .map(|(fi, f)| {
+        .map(|&(fi, range_start, range_end)| {
+            let f = &files[fi];
             let mut buckets: [Vec<(u32, u64)>; B] = std::array::from_fn(|_| Vec::new());
             let mut generic = Vec::new();
-            let mut start = memchr(b'\n', &f.map).map_or(f.map.len(), |x| x + 1);
-            while start < f.map.len() {
-                let end = memchr(b'\n', &f.map[start..]).map_or(f.map.len(), |x| start + x);
+            let mut start = range_start;
+            while start < range_end {
+                let end = memchr(b'\n', &f.map[start..range_end]).map_or(range_end, |x| start + x);
                 let line = &f.map[start..end];
                 if let Some(v) = fields7(line) {
                     if !v[0].is_empty() {
@@ -948,7 +963,7 @@ fn owned_event_refs_only(files: &[MappedCsv], key: u64, bound: usize, ws: i64) -
                         }
                     }
                 }
-                start = if end < f.map.len() { end + 1 } else { end };
+                start = if end < range_end { end + 1 } else { end };
             }
             (buckets, generic)
         })
@@ -1143,15 +1158,30 @@ fn recover_click_key(files: &[MappedCsv]) -> (u64, usize) {
     (found.unwrap_or(0), rows)
 }
 fn parse_click_refs(files: &[MappedCsv], key: u64, bound: usize) -> (Vec<LineRef>, Vec<LineRef>) {
-    let chunks: Vec<_> = files
+    let chunk_bytes = 8 * 1024 * 1024;
+    let mut scan_ranges = Vec::new();
+    for (fi, f) in files.iter().enumerate() {
+        let mut start = memchr(b'\n', &f.map).map_or(f.map.len(), |x| x + 1);
+        while start < f.map.len() {
+            let probe = (start + chunk_bytes).min(f.map.len());
+            let end = if probe == f.map.len() {
+                probe
+            } else {
+                memchr(b'\n', &f.map[probe..]).map_or(f.map.len(), |x| probe + x + 1)
+            };
+            scan_ranges.push((fi, start, end));
+            start = end
+        }
+    }
+    let chunks: Vec<_> = scan_ranges
         .par_iter()
-        .enumerate()
-        .map(|(fi, f)| {
-            let mut dense = Vec::with_capacity(f.map.len() / 60);
+        .map(|&(fi, range_start, range_end)| {
+            let f = &files[fi];
+            let mut dense = Vec::with_capacity((range_end - range_start) / 60);
             let mut generic = Vec::new();
-            let mut start = memchr(b'\n', &f.map).map_or(f.map.len(), |x| x + 1);
-            while start < f.map.len() {
-                let end = memchr(b'\n', &f.map[start..]).map_or(f.map.len(), |x| start + x);
+            let mut start = range_start;
+            while start < range_end {
+                let end = memchr(b'\n', &f.map[start..range_end]).map_or(range_end, |x| start + x);
                 let line = &f.map[start..end];
                 if let Some(v) = fields4(line) {
                     if !v[0].is_empty() {
@@ -1169,7 +1199,7 @@ fn parse_click_refs(files: &[MappedCsv], key: u64, bound: usize) -> (Vec<LineRef
                         }
                     }
                 }
-                start = if end < f.map.len() { end + 1 } else { end }
+                start = if end < range_end { end + 1 } else { end }
             }
             (dense, generic)
         })
@@ -1840,13 +1870,32 @@ fn main() {
     }
 
     let event_maps = map_csv(&data.join("events"));
-    let (event_key, event_rows) = recover_event_key(&event_maps);
+    let (event_key, event_bound) = recover_event_key(&event_maps);
     let derived_click_key = (event_key != 0)
         .then(|| click_key_from_event(event_key))
         .flatten();
+    let click_data = data.to_path_buf();
+    let click_scan_task = std::env::var_os("NO_OVERLAP_CLICK_SCAN")
+        .is_none()
+        .then(|| {
+            std::thread::spawn(move || {
+                let maps = map_csv(&click_data.join("clicks"));
+                let (key, bound) = derived_click_key
+                    .map(|k| (k, event_bound))
+                    .unwrap_or_else(|| recover_click_key(&maps));
+                let (dense, generic) = parse_click_refs(&maps, key, bound);
+                let winners = dedup_click_refs(dense, generic, &maps);
+                (maps, winners)
+            })
+        });
     let mut uf = link_task.join().unwrap();
     eprintln!("links/setup {:?}", started.elapsed());
-    let winners = owned_event_refs_only(&event_maps, event_key, event_rows, ws);
+    let winners = owned_event_refs_only(&event_maps, event_key, event_bound, ws);
+    let event_rows = winners
+        .iter()
+        .map(|r| r.index as usize + 1)
+        .max()
+        .unwrap_or(event_bound);
     let unique_events = winners.len();
     let user_fast = recover_user_key(&winners, &event_maps, event_rows);
     let mut linked_small = vec![[u32::MAX; 9]; user_fast.map_or(0, |x| x.1)];
@@ -2028,14 +2077,17 @@ fn main() {
         started.elapsed()
     );
 
-    let click_maps = map_csv(&data.join("clicks"));
-    let (click_key, click_rows) = if let Some(k) = derived_click_key {
-        (k, event_rows)
+    let (click_maps, click_winners) = if let Some(task) = click_scan_task {
+        task.join().unwrap()
     } else {
-        recover_click_key(&click_maps)
+        let maps = map_csv(&data.join("clicks"));
+        let (key, bound) = derived_click_key
+            .map(|k| (k, event_rows))
+            .unwrap_or_else(|| recover_click_key(&maps));
+        let (dense, generic) = parse_click_refs(&maps, key, bound);
+        let winners = dedup_click_refs(dense, generic, &maps);
+        (maps, winners)
     };
-    let (dense_clicks, generic_clicks) = parse_click_refs(&click_maps, click_key, click_rows);
-    let click_winners = dedup_click_refs(dense_clicks, generic_clicks, &click_maps);
     let pre_clicks: Vec<PreClick> = click_winners
         .par_iter()
         .filter_map(|r| {
