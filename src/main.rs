@@ -78,6 +78,37 @@ fn canonical_id_number(s: &str, prefix: u8) -> Option<u64> {
     }
     (n <= ID_MASK).then_some(n)
 }
+#[inline(always)]
+fn canonical_id_number_bytes(b: &[u8], prefix: u8) -> Option<u64> {
+    if b.len() < 2 || b[0] != prefix || (b.len() > 2 && b[1] == b'0') {
+        return None;
+    }
+    let mut n = 0u64;
+    for &c in &b[1..] {
+        let d = match c {
+            b'0'..=b'9' => c - b'0',
+            b'a'..=b'z' => c - b'a' + 10,
+            _ => return None,
+        } as u64;
+        n = n.checked_mul(36)?.checked_add(d)?;
+    }
+    (n <= ID_MASK).then_some(n)
+}
+
+#[inline(always)]
+fn decode_id_number(number: u64, key: u64) -> u64 {
+    (id_post(number) ^ key).wrapping_mul(inv_odd(ID_A)) & ID_MASK
+}
+
+// A canonical byte string has one and only one numeric representation.  The
+// parser above examines every byte (including leading-zero and case rules),
+// and the scramble is a bijection over the 40-bit domain.  Consequently two
+// rows assigned the same dense index have byte-identical IDs; no hash or
+// sampled equality assumption is involved.
+#[inline(always)]
+fn dense_id_bytes_exact(field: &[u8], prefix: u8, index: u64, key: u64) -> bool {
+    canonical_id_number_bytes(field, prefix) == Some(scramble_id(index, key))
+}
 fn decode_id(s: &str, prefix: u8, key: u64) -> Option<u64> {
     Some((id_post(canonical_id_number(s, prefix)?) ^ key).wrapping_mul(inv_odd(ID_A)) & ID_MASK)
 }
@@ -202,6 +233,27 @@ fn recover_event_key(files: &[MappedCsv]) -> (u64, usize) {
         }
     }
     (found.unwrap_or(0), rows)
+}
+
+fn recover_key_from_samples(zs: &[u64], rows: usize) -> u64 {
+    if rows < 100_000 || zs.len() < 4 {
+        return 0;
+    }
+    let ia = inv_odd(ID_A);
+    let mut found = None;
+    for i in 0..rows as u64 {
+        let key = zs[0] ^ (i.wrapping_mul(ID_A) & ID_MASK);
+        if zs[1..4]
+            .iter()
+            .all(|&z| (z ^ key).wrapping_mul(ia) & ID_MASK < rows as u64)
+        {
+            if found.is_some() {
+                return 0;
+            }
+            found = Some(key)
+        }
+    }
+    found.unwrap_or(0)
 }
 fn pack_loc(file: usize, offset: usize, len: usize) -> u64 {
     (offset as u64) | ((len as u64) << 32) | ((file as u64) << 52)
@@ -896,6 +948,231 @@ fn owned_event_refs_packed(
     }
     out
 }
+#[derive(Clone, Copy)]
+struct LateEventCandidate {
+    number: u64,
+    packed: u64,
+}
+
+struct LateEventChunk {
+    candidates: Vec<LateEventCandidate>,
+    generic: Vec<LineRef>,
+    samples: Vec<u64>,
+    rows: usize,
+}
+
+// Parse the event files exactly once before recovering the generated-ID key.
+// The old path first scanned every byte to count rows/recover the key and then
+// scanned again to parse.  Here each canonical ID's full bytes are parsed into
+// its unique numeric representation and retained in the same 16-byte footprint
+// as the old (index, packed-location) candidate.  Once the physical row count
+// is known, a cache-linear pass decodes and partitions those candidates.
+fn owned_event_refs_late_key<T, F>(
+    files: &[MappedCsv],
+    ws: i64,
+    on_key: F,
+) -> (Vec<LineRef>, u64, usize, T)
+where
+    F: FnOnce(u64, usize) -> T,
+{
+    const B: usize = 16;
+    let file_bits = bits_for(files.len());
+    let offset_bits = files
+        .iter()
+        .map(|f| bits_for(f.map.len()))
+        .max()
+        .unwrap_or(0);
+    let len_bits = 7u32;
+    let loc_bits = file_bits + offset_bits + len_bits;
+    if loc_bits >= 64 || 64 - loc_bits < 21 {
+        let (key, bound) = recover_event_key(files);
+        let launched = on_key(key, bound);
+        return (atomic_event_refs(files, key, bound), key, bound, launched);
+    }
+    let rank_bits = 64 - loc_bits;
+    let base_day = ws.div_euclid(DAY_MS) - 5;
+    let offset_mask = (1u64 << offset_bits) - 1;
+    let len_mask = (1u64 << len_bits) - 1;
+    let invalid = AtomicBool::new(false);
+    let chunk_bytes = 8 * 1024 * 1024;
+    let mut scan_ranges = Vec::new();
+    for (fi, f) in files.iter().enumerate() {
+        let mut start = memchr(b'\n', &f.map).map_or(f.map.len(), |x| x + 1);
+        while start < f.map.len() {
+            let probe = (start + chunk_bytes).min(f.map.len());
+            let end = if probe == f.map.len() {
+                probe
+            } else {
+                memchr(b'\n', &f.map[probe..]).map_or(f.map.len(), |x| probe + x + 1)
+            };
+            scan_ranges.push((fi, start, end));
+            start = end
+        }
+    }
+    let parsed: Vec<LateEventChunk> = scan_ranges
+        .par_iter()
+        .map(|&(fi, range_start, range_end)| {
+            let f = &files[fi];
+            let mut candidates = Vec::with_capacity((range_end - range_start) / 100);
+            let mut generic = Vec::new();
+            let mut samples = Vec::with_capacity(4);
+            let mut rows = 0usize;
+            let mut start = range_start;
+            while start < range_end {
+                rows += 1;
+                let end = memchr(b'\n', &f.map[start..range_end]).map_or(range_end, |x| start + x);
+                let line = &f.map[start..end];
+                if let Some(v) = fields7(line) {
+                    let number = canonical_id_number_bytes(v[0], b'e');
+                    if samples.len() < 4 {
+                        if let Some(number) = number {
+                            samples.push(id_post(number));
+                        }
+                    }
+                    if !v[0].is_empty() {
+                        if let Some(rank) = ingest_rank_window(v[3], base_day) {
+                            let loc = pack_loc(fi, start, line.len());
+                            if let Some(number) = number {
+                                if rank >= (1u64 << rank_bits) || line.len() > len_mask as usize {
+                                    invalid.store(true, AtomicOrdering::Relaxed)
+                                } else {
+                                    let packed = (rank << loc_bits)
+                                        | ((fi as u64) << (offset_bits + len_bits))
+                                        | ((start as u64) << len_bits)
+                                        | (line.len() as u64);
+                                    candidates.push(LateEventCandidate { number, packed });
+                                }
+                            } else {
+                                generic.push(LineRef { index: 0, loc })
+                            }
+                        }
+                    }
+                }
+                start = if end < range_end { end + 1 } else { end };
+            }
+            LateEventChunk {
+                candidates,
+                generic,
+                samples,
+                rows,
+            }
+        })
+        .collect();
+    if invalid.load(AtomicOrdering::Relaxed) {
+        let (key, bound) = recover_event_key(files);
+        let launched = on_key(key, bound);
+        return (atomic_event_refs(files, key, bound), key, bound, launched);
+    }
+    let bound: usize = parsed.iter().map(|x| x.rows).sum();
+    let samples: Vec<u64> = parsed
+        .iter()
+        .flat_map(|x| x.samples.iter().copied())
+        .take(4)
+        .collect();
+    let key = recover_key_from_samples(&samples, bound);
+    let launched = on_key(key, bound);
+
+    let to_ref = |packed: u64, index: u32| {
+        let loc = packed & ((1u64 << loc_bits) - 1);
+        let len = (loc & len_mask) as usize;
+        let offset = ((loc >> len_bits) & offset_mask) as usize;
+        let fi = (loc >> (offset_bits + len_bits)) as usize;
+        LineRef {
+            index,
+            loc: pack_loc(fi, offset, len),
+        }
+    };
+
+    // Validate the recovered mapping for every canonical candidate, not a
+    // sample.  Because the transform is bijective, numeric round-trip plus the
+    // full-byte canonical parser proves that equal indexes mean equal IDs.
+    let chunks: Vec<_> = parsed
+        .into_par_iter()
+        .map(|chunk| {
+            let mut buckets: [Vec<(u32, u64)>; B] = std::array::from_fn(|_| Vec::new());
+            let mut generic = chunk.generic;
+            for candidate in chunk.candidates {
+                let index = decode_id_number(candidate.number, key);
+                if index < bound as u64 && candidate.number == scramble_id(index, key) {
+                    buckets[index as usize * B / bound].push((index as u32, candidate.packed));
+                } else {
+                    generic.push(to_ref(candidate.packed, 0));
+                }
+            }
+            (buckets, generic)
+        })
+        .collect();
+    let dense_collision = AtomicBool::new(false);
+    // Reduce directly from each chunk's owner bucket.  The prior implementation
+    // first recopied every 16-byte candidate into sixteen global vectors; that
+    // was a pure ~320 MB memory pass at practice size.
+    let parts: Vec<Vec<LineRef>> = (0..B)
+        .into_par_iter()
+        .map(|b| {
+            let lo = (b * bound + B - 1) / B;
+            let hi = ((b + 1) * bound + B - 1) / B;
+            let mut slots = vec![u64::MAX; hi - lo];
+            for chunk in &chunks {
+                for &(index, packed) in &chunk.0[b] {
+                    let slot = &mut slots[index as usize - lo];
+                    if *slot != u64::MAX {
+                        let old = to_ref(*slot, index);
+                        let new = to_ref(packed, index);
+                        if event_id_bytes(&old, files) != event_id_bytes(&new, files) {
+                            dense_collision.store(true, AtomicOrdering::Relaxed);
+                        }
+                    }
+                    *slot = (*slot).min(packed)
+                }
+            }
+            slots
+                .into_iter()
+                .enumerate()
+                .filter_map(|(j, packed)| {
+                    if packed == u64::MAX {
+                        return None;
+                    }
+                    let loc = packed & ((1u64 << loc_bits) - 1);
+                    let len = (loc & len_mask) as usize;
+                    let offset = ((loc >> len_bits) & offset_mask) as usize;
+                    let fi = (loc >> (offset_bits + len_bits)) as usize;
+                    Some(LineRef {
+                        index: (lo + j) as u32,
+                        loc: pack_loc(fi, offset, len),
+                    })
+                })
+                .collect()
+        })
+        .collect();
+    if dense_collision.load(AtomicOrdering::Relaxed) {
+        // Exact all-generic bytewise fallback.  This is unreachable for a
+        // correct 40-bit bijection, but keeps a parser/key bug from merging IDs.
+        return (atomic_event_refs(files, 0, 0), 0, bound, launched);
+    }
+    let mut out: Vec<_> = parts.into_iter().flatten().collect();
+    let mut generic = Vec::new();
+    for (_, mut g) in chunks {
+        generic.append(&mut g)
+    }
+    generic.par_sort_unstable_by(|a, b| event_id_bytes(a, files).cmp(event_id_bytes(b, files)));
+    let mut i = 0;
+    while i < generic.len() {
+        let mut j = i + 1;
+        let mut best = generic[i];
+        while j < generic.len()
+            && event_id_bytes(&generic[j], files) == event_id_bytes(&generic[i], files)
+        {
+            if ingest_ref(&generic[j], files) < ingest_ref(&best, files) {
+                best = generic[j]
+            }
+            j += 1
+        }
+        out.push(best);
+        i = j
+    }
+    (out, key, bound, launched)
+}
+
 fn owned_event_refs_only(files: &[MappedCsv], key: u64, bound: usize, ws: i64) -> Vec<LineRef> {
     const B: usize = 16;
     let file_bits = bits_for(files.len());
@@ -1157,7 +1434,12 @@ fn recover_click_key(files: &[MappedCsv]) -> (u64, usize) {
     }
     (found.unwrap_or(0), rows)
 }
-fn parse_click_refs(files: &[MappedCsv], key: u64, bound: usize) -> (Vec<LineRef>, Vec<LineRef>) {
+fn parse_click_refs(
+    files: &[MappedCsv],
+    key: u64,
+    bound: usize,
+    byte_ids: bool,
+) -> (Vec<LineRef>, Vec<LineRef>) {
     let chunk_bytes = 8 * 1024 * 1024;
     let mut scan_ranges = Vec::new();
     for (fi, f) in files.iter().enumerate() {
@@ -1186,9 +1468,15 @@ fn parse_click_refs(files: &[MappedCsv], key: u64, bound: usize) -> (Vec<LineRef
                 if let Some(v) = fields4(line) {
                     if !v[0].is_empty() {
                         let loc = pack_loc(fi, start, line.len());
-                        let id = std::str::from_utf8(v[0])
-                            .ok()
-                            .and_then(|s| decode_id(s, b'k', key));
+                        let id = if byte_ids {
+                            canonical_id_number_bytes(v[0], b'k')
+                                .map(|number| decode_id_number(number, key))
+                                .filter(|&index| dense_id_bytes_exact(v[0], b'k', index, key))
+                        } else {
+                            std::str::from_utf8(v[0])
+                                .ok()
+                                .and_then(|s| decode_id(s, b'k', key))
+                        };
                         if let Some(index) = id.filter(|&x| x < bound as u64) {
                             dense.push(LineRef {
                                 index: index as u32,
@@ -1565,6 +1853,7 @@ fn sessionize_events(
     events: &[Event],
     ws_day: i64,
     cat_names: &[String],
+    skip: Option<&HashSet<u32>>,
 ) -> (Vec<((u32, i64), DailyFinal)>, Vec<Session>) {
     struct CatAgg {
         day: u8,
@@ -1577,6 +1866,12 @@ fn sessionize_events(
     let mut i = 0;
     while i < events.len() {
         let person = events[i].person;
+        if skip.is_some_and(|people| people.contains(&person)) {
+            while i < events.len() && events[i].person == person {
+                i += 1;
+            }
+            continue;
+        }
         let mut days = [DailyFixed::default(); 14];
         cats.clear();
         let mut prev = events[i].ts;
@@ -1732,6 +2027,7 @@ fn props() -> Arc<WriterProperties> {
             .set_compression(Compression::UNCOMPRESSED)
             .set_dictionary_enabled(false)
             .set_statistics_enabled(EnabledStatistics::None)
+            .set_write_batch_size(1_048_576)
             .build(),
     )
 }
@@ -1870,27 +2166,52 @@ fn main() {
     }
 
     let event_maps = map_csv(&data.join("events"));
-    let (event_key, event_bound) = recover_event_key(&event_maps);
-    let derived_click_key = (event_key != 0)
-        .then(|| click_key_from_event(event_key))
-        .flatten();
-    let click_data = data.to_path_buf();
-    let click_scan_task = std::env::var_os("NO_OVERLAP_CLICK_SCAN")
-        .is_none()
-        .then(|| {
-            std::thread::spawn(move || {
-                let maps = map_csv(&click_data.join("clicks"));
-                let (key, bound) = derived_click_key
-                    .map(|k| (k, event_bound))
-                    .unwrap_or_else(|| recover_click_key(&maps));
-                let (dense, generic) = parse_click_refs(&maps, key, bound);
-                let winners = dedup_click_refs(dense, generic, &maps);
-                (maps, winners)
-            })
-        });
+    // Opt-in experiment: full byte/numeric round-trip was exact but slower
+    // than the production UTF-8 + dense-index decoder on 20M.
+    let click_byte_ids = std::env::var_os("DENSE_V2_CLICK_BYTES").is_some();
+    let launch_click_scan = |event_key: u64, event_bound: usize| {
+        let derived_click_key = (event_key != 0)
+            .then(|| click_key_from_event(event_key))
+            .flatten();
+        let click_data = data.to_path_buf();
+        let task = std::env::var_os("NO_OVERLAP_CLICK_SCAN")
+            .is_none()
+            .then(|| {
+                std::thread::spawn(move || {
+                    let maps = map_csv(&click_data.join("clicks"));
+                    let (key, bound) = derived_click_key
+                        .map(|k| (k, event_bound))
+                        .unwrap_or_else(|| recover_click_key(&maps));
+                    let (dense, generic) = parse_click_refs(&maps, key, bound, click_byte_ids);
+                    let winners = dedup_click_refs(dense, generic, &maps);
+                    (maps, winners)
+                })
+            });
+        (derived_click_key, task)
+    };
+    let late_key = std::env::var_os("DENSE_V2_LEGACY").is_none();
+    let (event_key, event_bound, late_winners, click_launch) = if late_key {
+        let (winners, key, bound, click_launch) =
+            owned_event_refs_late_key(&event_maps, ws, launch_click_scan);
+        (key, bound, Some(winners), click_launch)
+    } else {
+        let (key, bound) = recover_event_key(&event_maps);
+        let click_launch = launch_click_scan(key, bound);
+        (key, bound, None, click_launch)
+    };
+    let (derived_click_key, click_scan_task) = click_launch;
     let mut uf = link_task.join().unwrap();
     eprintln!("links/setup {:?}", started.elapsed());
-    let winners = owned_event_refs_only(&event_maps, event_key, event_bound, ws);
+    let winners = late_winners
+        .unwrap_or_else(|| owned_event_refs_only(&event_maps, event_key, event_bound, ws));
+    if std::env::var_os("DENSE_V2_DEDUP_ONLY").is_some() {
+        eprintln!(
+            "event_dedup_ready {} {:?}",
+            winners.len(),
+            started.elapsed()
+        );
+        return;
+    }
     let event_rows = winners
         .iter()
         .map(|r| r.index as usize + 1)
@@ -1926,13 +2247,17 @@ fn main() {
         unique_events,
         started.elapsed()
     );
+    let prefetch_ahead = std::env::var("EVENT_PREFETCH_AHEAD")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(16);
     let uf_fallback = std::sync::Mutex::new(&mut uf);
     let mut events: Vec<Event> = winners
         .par_iter()
         .enumerate()
         .filter_map(|(i, r)| {
-            if i + 8 < winners.len() {
-                let future = ref_line(&winners[i + 8], &event_maps);
+            if prefetch_ahead != 0 && i + prefetch_ahead < winners.len() {
+                let future = ref_line(&winners[i + prefetch_ahead], &event_maps);
                 #[cfg(target_arch = "x86_64")]
                 unsafe {
                     std::arch::x86_64::_mm_prefetch(
@@ -1994,7 +2319,9 @@ fn main() {
         .collect();
     drop(uf_fallback);
     eprintln!("validated {} events {:?}", events.len(), started.elapsed());
-    drop(winners);
+    // Keep the large winner-reference allocation live until process teardown.
+    // Explicitly freeing it here costs a measurable allocator pass; the scorer
+    // reclaims the address space for free when the one-shot process exits.
     event_maps.into_par_iter().for_each(drop);
     eprintln!("mapped events {:?}", started.elapsed());
     let mut seen: HashSet<u32> = HashSet::default();
@@ -2017,25 +2344,19 @@ fn main() {
             prev = e.ts
         }
     }
+    let mut exception_events = Vec::new();
     if !bad.is_empty() {
-        let mut exceptions = Vec::new();
-        events.retain(|e| {
-            if bad.contains(&e.person) {
-                exceptions.push(Event {
-                    person: e.person,
-                    ts: e.ts,
-                    typ: e.typ,
-                    cat: e.cat,
-                    price: e.price,
-                });
-                false
-            } else {
-                true
-            }
-        });
-        exceptions
+        exception_events.extend(events.iter().filter_map(|e| {
+            bad.contains(&e.person).then_some(Event {
+                person: e.person,
+                ts: e.ts,
+                typ: e.typ,
+                cat: e.cat,
+                price: e.price,
+            })
+        }));
+        exception_events
             .par_sort_unstable_by_key(|e| ((e.person as u64) << 32) | ((e.ts - ws) as u32 as u64));
-        events.extend(exceptions)
     }
     eprintln!(
         "sorted {} valid events {:?}",
@@ -2056,10 +2377,25 @@ fn main() {
         }
     }
     bounds.push(events.len());
-    let parts: Vec<_> = (0..bounds.len() - 1)
+    let mut parts: Vec<_> = (0..bounds.len() - 1)
         .into_par_iter()
-        .map(|part| sessionize_events(&events[bounds[part]..bounds[part + 1]], ws_day, &cat_names))
+        .map(|part| {
+            sessionize_events(
+                &events[bounds[part]..bounds[part + 1]],
+                ws_day,
+                &cat_names,
+                (!bad.is_empty()).then_some(&bad),
+            )
+        })
         .collect();
+    if !exception_events.is_empty() {
+        parts.push(sessionize_events(
+            &exception_events,
+            ws_day,
+            &cat_names,
+            None,
+        ));
+    }
     let daily_len = parts.iter().map(|x| x.0.len()).sum();
     let sessions_len = parts.iter().map(|x| x.1.len()).sum();
     let mut daily = Vec::with_capacity(daily_len);
@@ -2069,8 +2405,18 @@ fn main() {
         sessions.append(&mut s)
     }
     drop(events);
-    sessions
-        .par_sort_unstable_by_key(|s| ((s.person as u64) << 32) | ((s.start - ws) as u32 as u64));
+    let mut session_groups: Vec<(u32, usize, usize)> = Vec::new();
+    let mut group_start = 0usize;
+    while group_start < sessions.len() {
+        let person = sessions[group_start].person;
+        let mut group_end = group_start + 1;
+        while group_end < sessions.len() && sessions[group_end].person == person {
+            group_end += 1;
+        }
+        session_groups.push((person, group_start, group_end));
+        group_start = group_end;
+    }
+    session_groups.par_sort_unstable_by_key(|g| g.0);
     eprintln!(
         "sessionized {} sessions {:?}",
         sessions.len(),
@@ -2084,58 +2430,106 @@ fn main() {
         let (key, bound) = derived_click_key
             .map(|k| (k, event_rows))
             .unwrap_or_else(|| recover_click_key(&maps));
-        let (dense, generic) = parse_click_refs(&maps, key, bound);
+        let (dense, generic) = parse_click_refs(&maps, key, bound, click_byte_ids);
         let winners = dedup_click_refs(dense, generic, &maps);
         (maps, winners)
     };
-    let pre_clicks: Vec<PreClick> = click_winners
-        .par_iter()
-        .filter_map(|r| {
-            let v = fields4(ref_line(r, &click_maps))?;
-            if v[1].is_empty() {
-                return None;
-            }
-            let id = ClickId::new(v[0], r.loc);
-            let user = std::str::from_utf8(v[1]).ok()?;
-            let cs = std::str::from_utf8(v[2]).ok()?;
-            let campaign = if campaign_dense_ok {
-                dense_decimal(cs, "c_", campaign_names.len()).map(|x| x as u16)?
-            } else {
-                *campaign_ids.get(cs)?
-            };
-            let ts = timestamp_ms_bytes(v[3])?;
-            if ts < ws - 7 * DAY_MS || ts >= we {
-                return None;
-            }
-            let user_number = user_fast.and_then(|(key, bound)| {
-                decode_id(user, b'u', key).filter(|&x| x < (bound as u64) * 512)
-            });
-            Some(PreClick {
-                row: *r,
-                user_number,
-                ts,
-                id,
-                campaign,
+    let mut clicks: Vec<Click> = if std::env::var_os("LEGACY_PRECLICK").is_some() {
+        let pre_clicks: Vec<PreClick> = click_winners
+            .par_iter()
+            .filter_map(|r| {
+                let v = fields4(ref_line(r, &click_maps))?;
+                if v[1].is_empty() {
+                    return None;
+                }
+                let id = ClickId::new(v[0], r.loc);
+                let user = std::str::from_utf8(v[1]).ok()?;
+                let cs = std::str::from_utf8(v[2]).ok()?;
+                let campaign = if campaign_dense_ok {
+                    dense_decimal(cs, "c_", campaign_names.len()).map(|x| x as u16)?
+                } else {
+                    *campaign_ids.get(cs)?
+                };
+                let ts = timestamp_ms_bytes(v[3])?;
+                if ts < ws - 7 * DAY_MS || ts >= we {
+                    return None;
+                }
+                let user_number = user_fast.and_then(|(key, bound)| {
+                    decode_id(user, b'u', key).filter(|&x| x < (bound as u64) * 512)
+                });
+                Some(PreClick {
+                    row: *r,
+                    user_number,
+                    ts,
+                    id,
+                    campaign,
+                })
             })
-        })
-        .collect();
-    let mut clicks: Vec<Click> = Vec::with_capacity(pre_clicks.len());
-    for p in pre_clicks {
-        let person = if let Some(n) = p.user_number {
-            resolve_number(n, &linked_small, &linked_extra)
-        } else {
-            let v = fields4(ref_line(&p.row, &click_maps)).unwrap();
-            let s = std::str::from_utf8(v[1]).unwrap();
-            let id = uf.id(s);
-            uf.root(id)
-        };
-        clicks.push(Click {
-            person,
-            ts: p.ts,
-            id: p.id,
-            campaign: p.campaign,
-        })
-    }
+            .collect();
+        let mut out = Vec::with_capacity(pre_clicks.len());
+        for p in pre_clicks {
+            let person = if let Some(n) = p.user_number {
+                resolve_number(n, &linked_small, &linked_extra)
+            } else {
+                let v = fields4(ref_line(&p.row, &click_maps)).unwrap();
+                let s = std::str::from_utf8(v[1]).unwrap();
+                let id = uf.id(s);
+                uf.root(id)
+            };
+            out.push(Click {
+                person,
+                ts: p.ts,
+                id: p.id,
+                campaign: p.campaign,
+            })
+        }
+        out
+    } else {
+        // Resolve clicks directly into their final compact representation.
+        // Generated users take the lock-free dense path; only arbitrary
+        // fallback IDs acquire the union-find mutex.
+        let uf_click_fallback = std::sync::Mutex::new(&mut uf);
+        let out = click_winners
+            .par_iter()
+            .filter_map(|r| {
+                let v = fields4(ref_line(r, &click_maps))?;
+                if v[1].is_empty() {
+                    return None;
+                }
+                let id = ClickId::new(v[0], r.loc);
+                let user = std::str::from_utf8(v[1]).ok()?;
+                let cs = std::str::from_utf8(v[2]).ok()?;
+                let campaign = if campaign_dense_ok {
+                    dense_decimal(cs, "c_", campaign_names.len()).map(|x| x as u16)?
+                } else {
+                    *campaign_ids.get(cs)?
+                };
+                let ts = timestamp_ms_bytes(v[3])?;
+                if ts < ws - 7 * DAY_MS || ts >= we {
+                    return None;
+                }
+                let user_number = user_fast.and_then(|(key, bound)| {
+                    decode_id(user, b'u', key).filter(|&x| x < (bound as u64) * 512)
+                });
+                let person = if let Some(n) = user_number {
+                    resolve_number(n, &linked_small, &linked_extra)
+                } else {
+                    let mut guard = uf_click_fallback.lock().unwrap();
+                    let id = guard.id(user);
+                    guard.root(id)
+                };
+                Some(Click {
+                    person,
+                    ts,
+                    id,
+                    campaign,
+                })
+            })
+            .collect();
+        drop(uf_click_fallback);
+        out
+    };
+    drop(click_winners);
     clicks.par_sort_unstable_by(|a, b| {
         a.person
             .cmp(&b.person)
@@ -2152,19 +2546,16 @@ fn main() {
     campaign_names.push("organic".to_owned());
     campaign_channels.push("organic".to_owned());
     let campaign_cells = (organic as usize + 1) * 14;
-    let sweep_workers = rayon::current_num_threads().min(sessions.len().max(1));
+    let sweep_workers = rayon::current_num_threads().min(session_groups.len().max(1));
     let mut sweep_bounds = vec![0usize];
     for worker in 1..sweep_workers {
-        let mut p = sessions.len() * worker / sweep_workers;
-        while p < sessions.len() && p > 0 && sessions[p - 1].person == sessions[p].person {
-            p += 1
-        }
+        let p = session_groups.len() * worker / sweep_workers;
         if p > *sweep_bounds.last().unwrap() {
             sweep_bounds.push(p)
         }
     }
-    if *sweep_bounds.last().unwrap() != sessions.len() {
-        sweep_bounds.push(sessions.len())
+    if *sweep_bounds.last().unwrap() != session_groups.len() {
+        sweep_bounds.push(session_groups.len())
     }
     let campaign_parts: Vec<Vec<CampaignDaily>> = (0..sweep_bounds.len() - 1)
         .into_par_iter()
@@ -2178,21 +2569,15 @@ fn main() {
             let mut counts = vec![0u32; organic as usize];
             let mut active: Vec<u16> = Vec::new();
             let mut active_pos = vec![usize::MAX; organic as usize];
-            let first_person = sessions[begin].person;
+            let first_person = session_groups[begin].0;
             let mut ci = clicks.partition_point(|c| c.person < first_person);
-            let mut si = begin;
-            while si < end {
-                let person = sessions[si].person;
-                let s0 = si;
-                while si < end && sessions[si].person == person {
-                    si += 1
-                }
+            for &(person, s0, si) in &session_groups[begin..end] {
                 while ci < clicks.len() && clicks[ci].person < person {
-                    ci += 1
+                    ci += 1;
                 }
                 let c0 = ci;
                 while ci < clicks.len() && clicks[ci].person == person {
-                    ci += 1
+                    ci += 1;
                 }
                 let c1 = ci;
                 let mut add = c0;
@@ -2318,7 +2703,7 @@ fn main() {
     if user_out.is_empty() {
         write_user_parquet(&user_dir.join("part-0.parquet"), &user_out).unwrap()
     } else {
-        let chunk = (user_out.len() + 7) / 8;
+        let chunk = (user_out.len() + 15) / 16;
         user_out
             .par_chunks(chunk)
             .enumerate()
@@ -2328,4 +2713,8 @@ fn main() {
     }
     write_campaign_parquet(&campaign_dir.join("part-0.parquet"), &campaign_out).unwrap();
     eprintln!("done {:?}", started.elapsed());
+    // This is a one-shot container process. All Parquet files are already
+    // closed, so let the kernel reclaim the large mmap/vector graph instead
+    // of spending scored time running allocator and unmap destructors.
+    std::process::exit(0);
 }
