@@ -4,6 +4,7 @@ official-downloads/
 experiments/
 tools/
 dev/
+fixtures/
 bench*/
 out/
 out-rust-*/
