@@ -68,7 +68,7 @@ def main():
         sys.exit(f"no fixtures in {fx_dir}")
     for case in cases:
         data = os.path.join(fx_dir, case, "data")
-        if not os.path.isdir(data):
+        if not os.path.isfile(os.path.join(data, "manifest.json")):
             data = os.path.join(fx_dir, case, "input")
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as out:
             env = dict(os.environ, DATA_DIR=data, OUTPUT_DIR=out)

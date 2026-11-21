@@ -6,6 +6,7 @@ tools/
 dev/
 bench*/
 out/
+out-rust-*/
 __pycache__/
 *.pyc
 target/

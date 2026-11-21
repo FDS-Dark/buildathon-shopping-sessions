@@ -1,21 +1,21 @@
 # Shopping Sessions
 
-An exact, optimized Polars pipeline for the Databricks Shopping Sessions track. It resolves linked identities, cleans and deduplicates events and clicks, builds sessions, attributes and assists campaigns, and writes both required Parquet tables.
+An exact, optimized native Rust pipeline for the Databricks Shopping Sessions track. It resolves linked identities, cleans and deduplicates events and clicks, builds sessions, attributes and assists campaigns, and writes both required Parquet tables directly.
 
 The implementation passes all 36 official edge-case fixtures and exactly matches both official tables for the 1M-event public development set.
 
 ## Implementation
 
-- Strict raw-line CSV parsing implements the challenge dialect instead of relying on permissive CSV defaults.
-- Identity links are resolved transitively with byte-wise minimum canonical IDs.
-- Events are deduplicated before validation, then compacted and sessionized by canonical person.
-- Click attribution uses an exact backward as-of join with byte-wise click-ID tie-breaking.
-- Assist clicks are merged into seven-day campaign coverage intervals before the range join.
+- An allocation-conscious mmap parser implements the exact challenge dialect.
+- Identity links use iterative union-by-size with separately tracked byte-wise minima.
+- Guarded generator-ID recovery enables dense direct deduplication with an exact generic fallback.
+- Compact records, parallel person-aligned sweeps, and direct Parquet output minimize memory traffic.
+- The release binary is trained with a pinned Linux PGO profile and targets the scorer's Cascade Lake CPU.
 - The image honors the scorer's CPU, memory, filesystem, UID, and offline runtime constraints.
 
 ## Run and test locally
 
-You need Docker with buildx, and Python 3.10+ with `polars` for the test scripts. Install it with `pip install polars`.
+You need Docker with buildx. Python 3.10+ with `polars` is used only by the comparison scripts.
 
 Build the image and run all 36 fixtures:
 
@@ -35,13 +35,12 @@ make check-dev                          # exact diff against dev-answer/, the tr
 If your laptop cannot spare 8 cores and 24 GB, run with lower limits using `make run-dev CPUS=4 MEM=8g`. Your local times will not match the scorer anyway; only the board's times count.
 
 - **x86 Linux and Windows machines.** Build and run the amd64 image natively.
-- **Apple-silicon Macs.** Emulating amd64 is slow. For fast local loops, build a native image with `make build run-dev PLATFORM=linux/arm64`. The Dockerfile pins no platform, so it builds either way. Check the amd64 image before you submit.
+- **Apple-silicon Macs.** The optimized image targets Cascade Lake and must be built as `linux/amd64`; emulation is expected to be slow.
 
-To iterate without Docker:
+To build the native binary without Docker on x86-64:
 
 ```sh
-pip install polars==2.1.0
-python3 scripts/run_fixtures.py fixtures -- python3 pipeline/pipeline.py
+cargo build --release --locked
 ```
 
 ## Submitting and scoring
@@ -66,10 +65,10 @@ Scorers are Google Cloud n2 Intel Xeon machines, Cascade Lake or newer, with AVX
 
 ## Common pitfalls
 
-- **Polars' CSV reader differs from `rules.md`.** Its quoting and malformed-line handling may not match `rules.md`. Test against the fixtures before relying on it.
-- **Threads.** `pipeline.py` sets `POLARS_MAX_THREADS` from `NCPU` before importing Polars. Otherwise Polars sizes its thread pool from the host machine's cores, which inside Docker on a Mac can differ from your CPU limit.
-- **Memory.** The container has 24 GB and no swap. Eager DataFrames over 60M+ rows of strings fill that fast. Lazy queries and the streaming engine help, and `POLARS_TEMP_DIR` already points at `/scratch`.
-- **`\d` is not `[0-9]`.** In several regex engines, including Rust's used by Polars, `\d` matches any Unicode digit. The rules mean ASCII digits only.
+- **CSV semantics.** The challenge dialect is narrower than general CSV; the native parser preserves literal carriage returns and rejects malformed quoting and widths exactly.
+- **Fast-path safety.** Dense-ID acceleration is guarded and falls back to exact byte-key processing when generator invariants do not hold.
+- **Threads.** Runtime parallelism is capped at eight Rayon workers to match the scorer.
+- **Memory.** The full 60M rehearsal stays in memory and requires no scratch spill.
 - **Extra files in output folders.** `_SUCCESS` and other non-Parquet files in the output folders are ignored.
 
 ## Self-checks
@@ -80,7 +79,8 @@ Scorers are Google Cloud n2 Intel Xeon machines, Cascade Lake or newer, with AVX
 
 ## Files
 
-- `pipeline/pipeline.py` holds your pipeline code.
+- `src/main.rs` holds the native pipeline.
+- `pgo/merged.profdata` is the pinned Linux training profile for this exact source revision.
 - `Dockerfile` builds a `linux/amd64` image for the Intel Xeon scorers.
 - `fixtures/` holds the 36 official edge cases and expected tables.
 - `scripts/` runs your image the way the scorer does and diffs the output.

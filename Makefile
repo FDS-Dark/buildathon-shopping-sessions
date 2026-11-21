@@ -1,7 +1,7 @@
 IMAGE ?= shopping-sessions:latest
 CPUS  ?= 8
 MEM   ?= 24g
-# The scorer's platform. PLATFORM=linux/arm64 builds and runs natively on an Apple-silicon Mac, for fast local loops.
+# The native binary targets the scorer's Cascade Lake x86-64 CPUs.
 PLATFORM ?= linux/amd64
 DEV   ?= dev
 # In the monorepo the fixtures live two levels up; the published starter has its own copy.

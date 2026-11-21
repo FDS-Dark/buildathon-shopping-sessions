@@ -7,6 +7,10 @@ official-downloads/
 .dev-answer/
 experiments/
 tools/
+pipeline/
+scripts/
+requirements.txt
+Makefile
 __pycache__/
 .pytest_cache/
 *.md

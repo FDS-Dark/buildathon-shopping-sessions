@@ -1,0 +1,17 @@
+[package]
+name = "shopping-native"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+rustc-hash = "2.1"
+rayon = "1.10"
+memchr = "2.7"
+memmap2 = "0.9"
+parquet = { version = "60.1.0", default-features = false }
+mimalloc = { version = "0.1", default-features = false }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+panic = "abort"
