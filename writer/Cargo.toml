@@ -1,0 +1,19 @@
+[package]
+name = "cleanroom-parquet-bench"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "fastengine_parquet"
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+parquet = { version = "60.1.0", default-features = false }
+rayon = "1.10"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+
+
