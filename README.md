@@ -14,6 +14,7 @@ The implementation passes the official edge-case corpus, exactly matches both pu
 - Half-hour occupancy sessionization with exact 30-minute boundaries.
 - Person-range click routing and parallel exact attribution/assist sweeps.
 - Direct C++ to Rust FFI for plain, uncompressed Parquet output.
+- A separately built exact Rust engine handles datasets that fail the globally validated dense-ID fast-path guards.
 - Explicit support for the scorer's read-only root, uid 1000, eight pinned vCPUs, and offline runtime.
 
 ## Build and run

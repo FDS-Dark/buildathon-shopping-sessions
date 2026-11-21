@@ -1113,7 +1113,7 @@ static int write_parquet_ffi(std::string const&out,std::vector<UserDailyTemp>con
 
 int main() {
   auto process_started=Clock::now();
-  fs::path data = std::getenv("DATA_DIR") ? std::getenv("DATA_DIR") : "bench20m";
+  fs::path data = std::getenv("DATA_DIR") ? std::getenv("DATA_DIR") : "/data";
   int ncpu = std::getenv("NCPU") ? std::max(1, std::atoi(std::getenv("NCPU"))) : 8;
   ncpu = std::min(ncpu, 8);
   bool verify_pack = std::getenv("VERIFY_PACK") != nullptr;
@@ -1121,6 +1121,11 @@ int main() {
   int bench_mode = std::getenv("BENCH_MODE") ? std::atoi(std::getenv("BENCH_MODE")) : 0;
   int64_t ws, we;
   if (!manifest_window(data, ws, we)) {
+    if (bench_mode == 0) {
+      ::execl("/fallback", "/fallback", static_cast<char *>(nullptr));
+      std::perror("exec /fallback");
+      return 127;
+    }
     std::cerr << "bad manifest\n";
     return 2;
   }
@@ -1153,6 +1158,11 @@ int main() {
   RecoveredKey user_recovered = recover_user_key(user_samples, person_bound);
   uint64_t user_dense_key = user_recovered.key;
   double recover_s = std::chrono::duration<double>(Clock::now() - recover_started).count();
+  if (bench_mode == 0 && (!event_recovered.valid || !user_recovered.valid)) {
+    ::execl("/fallback", "/fallback", static_cast<char *>(nullptr));
+    std::perror("exec /fallback");
+    return 127;
+  }
   auto links_started = Clock::now();
   auto links_future = std::async(std::launch::async, [&] {
     return IdentityMap::build(data / "links", user_dense_key, user_recovered.valid, person_bound,
@@ -1193,12 +1203,17 @@ int main() {
     dedup_s = std::chrono::duration<double>(Clock::now() - dedup_started).count();
   }
   auto link_wait_started=Clock::now();IdentityMap identities = links_future.get();double link_wait_s=std::chrono::duration<double>(Clock::now()-link_wait_started).count();
+  if (bench_mode == 0 && identities.domain_failed) {
+    ::execl("/fallback", "/fallback", static_cast<char *>(nullptr));
+    std::perror("exec /fallback");
+    return 127;
+  }
   double links_wall_s = std::chrono::duration<double>(Clock::now() - links_started).count();
   SessionKernelStats session_stats{}; double session_s=0;std::vector<CompactSession> compact_sessions;std::vector<uint32_t> session_offsets;std::vector<UserDailyTemp> user_daily;
   if(bench_mode==0&&event_recovered.valid&&user_recovered.valid&&!identities.domain_failed){auto ss=Clock::now();session_stats=build_sessions(data,workers,identities,person_bound,ncpu,ws,we,user_dense_key,fingerprints,&compact_sessions,&session_offsets,&user_daily,nullptr);session_s=std::chrono::duration<double>(Clock::now()-ss).count();}
   ClickResult click_stats{};std::vector<CampaignDailyTemp> campaign_daily;if(bench_mode==0&&!compact_sessions.empty())click_stats=run_clicks(data,ncpu,ws,we,user_dense_key,person_bound,identities,compact_sessions,session_offsets,&campaign_daily);
   if(bench_mode==0)if(const char*debug=std::getenv("DEBUG_CSV_DIR"))write_debug_csv(debug,user_daily,campaign_daily,identities,user_dense_key,person_bound,ws,load_products(data),read_campaigns(data));
-  double output_s=0,output_catalog_s=0;OutputTimings output_detail{};if(bench_mode==0)if(const char*outdir=std::getenv("OUTPUT_DIR")){auto os=Clock::now();auto oc=Clock::now();auto output_products=load_products(data);auto output_campaigns=read_campaigns(data);output_catalog_s=std::chrono::duration<double>(Clock::now()-oc).count();if(write_parquet_ffi(outdir,user_daily,campaign_daily,identities,user_dense_key,person_bound,ws,output_products,output_campaigns,ncpu,&output_detail)!=0)return 3;output_s=std::chrono::duration<double>(Clock::now()-os).count();}
+  double output_s=0,output_catalog_s=0;OutputTimings output_detail{};if(bench_mode==0){const char*outdir=std::getenv("OUTPUT_DIR");if(!outdir)outdir="/output";auto os=Clock::now();auto oc=Clock::now();auto output_products=load_products(data);auto output_campaigns=read_campaigns(data);output_catalog_s=std::chrono::duration<double>(Clock::now()-oc).count();if(write_parquet_ffi(outdir,user_daily,campaign_daily,identities,user_dense_key,person_bound,ws,output_products,output_campaigns,ncpu,&output_detail)!=0)return 3;output_s=std::chrono::duration<double>(Clock::now()-os).count();}
   double pipeline_s=std::chrono::duration<double>(Clock::now()-process_started).count();
 
   Stats total;
